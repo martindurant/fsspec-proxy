@@ -11,4 +11,3 @@ sources:
  - name: "MyAnaconda"
    path: "anaconda://my/"
 allow_reload: true
-

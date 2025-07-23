@@ -1,10 +1,16 @@
 from contextlib import asynccontextmanager
 import io
+import logging
+import os
+
 import fastapi
+import fsspec
 from fsspec_proxy.cors import CORSMiddleware
 from starlette.responses import StreamingResponse
 
 from fsspec_proxy import file_manager
+
+logger = logging.getLogger(__name__)
 
 
 @asynccontextmanager
@@ -14,37 +20,31 @@ async def lifespan(app: fastapi.FastAPI):
     yield
 
 
+origin = os.getenv("FSPEC_PROXY_ORIGIN", 'https://martindurant.pyscriptapps.com')
 app = fastapi.FastAPI(lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=['https://martindurant.pyscriptapps.com'],
+    allow_origins=[origin],
     allow_methods=["GET", "POST", "DELETE", "OPTION", "PUT"],
     allow_credentials=True,
     allow_headers=["*"]
 )
+m = fsspec.filesystem('memory')
+m.pipe_file("mytests/afile", b"hello world")
 
 
-@app.get("/api/list")
-async def list_root():
-    keys = list(app.manager.filesystems)
-    return {
-        "status": "ok",
-        "contents": [
-            {"name": k, "size": 0, "type": "directory"} for k in keys
-        ]
-    }
-
-
-@app.get("/api/list/{key}/{path:path}")
+@app.get("/api/proxies/{key}/list/{path:path}")
 async def list_dir(key, path):
+    path = path.rstrip("/")
+    logger.info(f"Listing {key} {path}")
     fs_info = app.manager.get_filesystem(key)
     if fs_info is None:
-        raise fastapi.HTTPException(status_code=404, detail="Item not found")
+        raise fastapi.HTTPException(status_code=404, detail="fs not found")
     path = f"{fs_info['path'].rstrip('/')}/{path.lstrip('/')}"
     try:
         out = await fs_info["instance"]._ls(path, detail=True)
     except FileNotFoundError:
-        raise fastapi.HTTPException(status_code=404, detail="Item not found")
+        raise fastapi.HTTPException(status_code=404, detail="path not found")
     out = [
         {"name": f"{key}/{o['name'].replace(fs_info['path'], '', 1).lstrip('/')}",
          "size": o["size"], "type": o["type"]}
@@ -53,7 +53,7 @@ async def list_dir(key, path):
     return {"status": "ok", "contents": out}
 
 
-@app.delete("/api/delete/{key}/{path:path}")
+@app.delete("/api/proxies/{key}/delete/{path:path}")
 async def delete_file(key, path, response: fastapi.Response):
     fs_info = app.manager.get_filesystem(key)
     path = f"{fs_info['path'].rstrip('/')}/{path.lstrip('/')}"
@@ -70,7 +70,7 @@ async def delete_file(key, path, response: fastapi.Response):
     response.status_code = 204
 
 
-@app.get("/api/bytes/{key}/{path:path}")
+@app.get("/api/proxies/{key}/bytes/{path:path}")
 async def get_bytes(key, path, request: fastapi.Request):
     start, end = _process_range(request.headers.get("Range"))
     fs_info = app.manager.get_filesystem(key)
@@ -84,7 +84,7 @@ async def get_bytes(key, path, request: fastapi.Request):
     return StreamingResponse(io.BytesIO(out), media_type="application/octet-stream")
 
 
-@app.post("/api/bytes/{key}/{path:path}")
+@app.post("/api/proxies/{key}/bytes/{path:path}")
 async def put_bytes(key, path, request: fastapi.Request, response: fastapi.Response):
     fs_info = app.manager.get_filesystem(key)
     if fs_info is None:
@@ -99,14 +99,6 @@ async def put_bytes(key, path, request: fastapi.Request, response: fastapi.Respo
         raise fastapi.HTTPException(status_code=404, detail="Item not found")
     response.status_code = 201
     return {"contents": []}
-
-
-@app.post("/api/config")
-async def setup(request: fastapi.Request):
-    if not app.manager.config.get("allow_reload", False):
-        raise fastapi.HTTPException(status_code=403, detail="Not Allowed")
-    app.manager.config = await request.json()
-    app.manager.initialize_filesystems()
 
 
 def _process_range(range):
